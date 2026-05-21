@@ -5,6 +5,13 @@ import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from stock_data import (
+    fetch_stock_price_and_mktcap,
+    fmt_market_cap,
+    fmt_close_price,
+)
+from disclosure_parser import parse_disclosure_details
+
 DART_KEY = os.environ["DART_API_KEY"]
 TG_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TG_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
@@ -27,8 +34,6 @@ EXCLUDE = ["철회", "기재정정", "정정"]
 
 SENT_FILE = "sent.json"
 HOLIDAY_FILE = "holidays.json"
-
-MARKET_MAP = {"Y": "유가", "K": "코스닥", "N": "코넥스", "E": "기타"}
 
 
 # ───────────────────────────────────────
@@ -66,21 +71,21 @@ def save_sent(sent):
 # 유틸리티
 # ───────────────────────────────────────
 def fmt_amount(value):
+    """금액을 억원 단위로 포맷"""
     try:
         v = int(str(value).replace(",", "").replace("-", "0"))
         if v == 0:
             return "-"
-        if v >= 100000000:
-            uk = v / 100000000
-            if uk >= 100:
-                return f"{uk:,.0f}억원"
-            return f"{uk:,.1f}억원"
-        return f"{v:,}원"
+        uk = v / 100000000
+        if uk >= 100:
+            return f"{uk:,.0f}억원"
+        return f"{uk:,.1f}억원"
     except (ValueError, TypeError):
         return str(value) if value else "-"
 
 
 def fmt_date(date_str):
+    """날짜 포맷 (YYYYMMDD → YYYY-MM-DD)"""
     if not date_str or date_str == "-":
         return "-"
     s = str(date_str).replace(".", "-").replace("/", "-")
@@ -94,7 +99,7 @@ def fmt_pct(value):
         return "-"
     try:
         v = float(str(value).replace(",", "").replace("%", ""))
-        return f"{v:.2f}%"
+        return f"{v:.1f}%"
     except (ValueError, TypeError):
         return str(value)
 
@@ -122,40 +127,24 @@ def is_preferred_stock(stock_type_str):
     return any(kw in stock_type_str for kw in PREFERRED_STOCK_KEYWORDS)
 
 
-def extract_premium(text):
+def get_price_ref_date(rcept_dt, rcept_tm):
     """
-    가액 결정방법 텍스트에서 할증률을 추출한다.
-    
-    예시:
-    - "...높은 가액에 7%를 할증한 금액..." → 7.0%
-    - "...산술평균한 가격과 최근일... 중 높은 가격 이상..." → "-" (할증 없음)
-    - "...10%를 가산한 금액..." → 10.0%
-    - "...에 5% 가산하여..." → 5.0%
-    
-    Returns: "7.0%" 형태의 문자열 or "-"
+    공시 시간 기준으로 종가 기준일 결정
+    - 15:30 이후 공시 → 이사회결의일 당일 종가
+    - 15:30 이전 공시 → 이사회결의일 전일 종가
     """
-    if not text or text == "-":
+    if not rcept_dt or not rcept_tm:
         return "-"
-    
-    # 할증/가산을 의미하는 키워드와 % 조합 검색
-    # 예: "7%를 할증", "10% 가산", "에 5%를 더한", "+ 7%", "플러스 5%"
-    patterns = [
-        r"([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:를|을)?\s*(?:할증|가산|더한|더하여|더해|플러스|할증하여)",
-        r"(?:할증|가산|더한|플러스)\s*(?:한|하여|하는|하면)?\s*([0-9]+(?:\.[0-9]+)?)\s*%",
-        r"에\s*([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:를|을)?\s*(?:할증|가산|더한|더하여|더해)",
-        r"\+\s*([0-9]+(?:\.[0-9]+)?)\s*%",
-    ]
-    
-    for pat in patterns:
-        m = re.search(pat, text)
-        if m:
-            try:
-                val = float(m.group(1))
-                return f"{val:.1f}%"
-            except ValueError:
-                continue
-    
-    return "-"
+    try:
+        tm_int = int(str(rcept_tm).zfill(4))
+        date_obj = datetime.strptime(rcept_dt, "%Y%m%d")
+        if tm_int >= 1530:
+            return date_obj.strftime("%Y-%m-%d")
+        else:
+            prev_date = date_obj - timedelta(days=1)
+            return prev_date.strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        return "-"
 
 
 # ───────────────────────────────────────
@@ -268,81 +257,78 @@ def fetch_detail(corp_code, rcept_no, type_code):
 # ───────────────────────────────────────
 # 메시지 포맷팅
 # ───────────────────────────────────────
-def format_cb_message(item, detail, market):
-    type_name = {"CB": "전환사채", "BW": "신주인수권부사채", "EB": "교환사채"}[item["_type_code"]]
-    type_label = {"CB": "전환", "BW": "행사", "EB": "교환"}[item["_type_code"]]
+def format_bond_message(item, detail):
+    """CB/BW/EB 통합 포맷"""
+    type_map = {
+        "CB": "전환사채발행결정",
+        "BW": "신주인수권부사채발행결정",
+        "EB": "교환사채발행결정",
+    }
+    type_code = item["_type_code"]
+    title_name = type_map[type_code]
     
     corp = item["corp_name"]
     rcept_no = item["rcept_no"]
+    rcept_dt = item.get("rcept_dt", "")
+    rcept_tm = item.get("rcept_tm", "")
+    corp_code = item.get("corp_code", "")
     url = f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcept_no}"
     
     if not detail:
         return (
-            f"✅[{market}] {type_name} 발행결정\n\n"
-            f"* 기업명: {corp}\n"
+            f"✅주요사항보고서({title_name})\n"
+            f"기업명: {corp}\n"
             f"(상세 정보 조회 실패 - 원문 확인 필요)\n\n"
             f"🔗 {url}"
         )
     
-    amount = fmt_amount(safe_get(detail, "bd_fta", "ovis_fta"))
-    coupon = safe_get(detail, "bd_intr_ex", "bd_intr_rt")
-    ytm = safe_get(detail, "bd_intr_sf", "bd_mtd_intr_rt")
+    # 기본정보
+    amount = fmt_amount(safe_get(detail, "bd_fta"))
+    
+    # 시가총액, 종가 (NaverFinance API)
+    price_ref_date = get_price_ref_date(rcept_dt, rcept_tm)
+    stock_data = fetch_stock_price_and_mktcap(corp_code, price_ref_date, DART_KEY)
+    mkt_cap_str = fmt_market_cap(stock_data["market_cap"])
+    close_price_str = fmt_close_price(stock_data["close_price"])
+    
+    # 공시 본문 파싱 (주식총수 대비 비율, Put/Call, Refixing, 인수인)
+    parsed = parse_disclosure_details(rcept_no)
+    
+    # 발행 스케줄
+    board_date = fmt_date(safe_get(detail, "bddd"))
+    issue_date = fmt_date(safe_get(detail, "pymd"))
+    maturity_date = fmt_date(safe_get(detail, "bd_mtd"))
+    
+    # 가격 조건
+    exec_price = fmt_num(safe_get(detail, "cv_prc"))
+    
+    # 금리 조건
+    coupon = safe_get(detail, "bd_intr_ex")
+    ytm = safe_get(detail, "bd_intr_sf")
     coupon_str = f"{coupon}% / {ytm}%" if coupon != "-" or ytm != "-" else "-"
     
-    board_date = fmt_date(safe_get(detail, "bddd"))
-    issue_date = fmt_date(safe_get(detail, "pymd", "bdis_pymd"))
-    maturity_date = fmt_date(safe_get(detail, "bd_mtd", "bdmt_ediscbd"))
-    
-    conv_price = fmt_num(safe_get(detail, "cv_prc", "ex_prc", "exct_prc"))
-    conv_ratio = fmt_pct(safe_get(detail, "act_mktprcdiv_rt", "ratlst_isstkrt"))
-    
-    # 할증률: 가액 결정방법 텍스트에서 추출
-    decision_text = safe_get(
-        detail,
-        "cv_prc_dmd_mth",      # 전환가액 결정방법
-        "ex_prc_dmd_mth",      # 행사가액 결정방법
-        "exct_prc_dmd_mth",    # 교환가액 결정방법
-        "cv_prc_dmd",
-        "ex_prc_dmd",
-        "exct_prc_dmd",
-    )
-    premium_str = extract_premium(decision_text)
-    
-    put_opt = safe_get(detail, "rpcmt_opt_ow_int_dts", "rpcmtad_pym")
-    call_opt = safe_get(detail, "spcmt_opt_ow_int_dts", "spcmtad_pym")
-    
-    # YTC (Yield to Call)
-    ytc = safe_get(detail, "spcmt_intr", "spcmt_intr_rt", "ytc")
-    ytc_str = f"{ytc}%" if ytc != "-" else "-"
-    
-    refix = safe_get(detail, "act_mktprcdv_lwlmt", "rfix_lwlmt")
-    refix_str = f"{refix}%" if refix != "-" else "-"
-    
-    underwriter = safe_get(detail, "atn_nm", "thrd_pps_corp_nm")
-    use = safe_get(detail, "fdpp_fclt", "fdpp_op", "use_purps")
-    
     return (
-        f"✅[{market}] {type_name} 발행결정\n\n"
-        f"* 기업명: {corp}\n"
-        f"* 발행금액: {amount}\n"
-        f"* Coupon/YTM: {coupon_str}\n"
-        f"* 이사회결의일: {board_date}\n"
-        f"* 발행일: {issue_date}\n"
-        f"* 만기일: {maturity_date}\n"
-        f"* {type_label}가액: {conv_price}원\n"
-        f"* 할증률: {premium_str}\n"
-        f"* 주식총수 대비 비율: {conv_ratio}\n"
-        f"* Put Option: {put_opt}\n"
-        f"* Call Option: {call_opt}\n"
-        f"* YTC: {ytc_str}\n"
-        f"* Refixing: {refix_str}\n"
-        f"* 인수인: {underwriter}\n"
-        f"* 자금사용목적: {use}\n\n"
+        f"✅주요사항보고서({title_name})\n"
+        f"기업명: {corp} (시가총액 {mkt_cap_str}억원)\n"
+        f"발행금액: {amount}\n"
+        f"행사가액: {exec_price}원 ({price_ref_date} 종가 {close_price_str}원)\n"
+        f"주식총수 대비 비율: {parsed['capital_ratio']}\n\n"
+        f"이사회결의일: {board_date}\n"
+        f"발행일: {issue_date}\n"
+        f"만기일: {maturity_date}\n\n"
+        f"Coupon/YTM: {coupon_str}\n"
+        f"Refixing: {parsed['refixing']}\n"
+        f"Put Option: {parsed['put_option']}\n"
+        f"Call Option: {parsed['call_option']}\n"
+        f"Call 비율: {parsed['call_ratio']}\n"
+        f"YTC: {parsed['ytc']}\n"
+        f"인수인: {parsed['underwriters']}\n\n"
         f"🔗 {url}"
     )
 
 
-def format_ri_message(item, detail, market):
+def format_ri_message(item, detail):
+    """유상증자"""
     corp = item["corp_name"]
     rcept_no = item["rcept_no"]
     url = f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcept_no}"
@@ -350,107 +336,112 @@ def format_ri_message(item, detail, market):
     if not detail:
         return None
     
-    stock_type = safe_get(detail, "nstk_kndn", "nstk_knd")
-    method = safe_get(detail, "ic_mthn", "nstk_asstd")
+    stock_type = safe_get(detail, "nstk_kndn")
+    method = safe_get(detail, "ic_mthn")
     
     public_keywords = ["주주배정", "일반공모", "실권주"]
     is_public = any(kw in method for kw in public_keywords)
     
     if is_preferred_stock(stock_type):
-        return _format_ri_preferred(item, detail, market, corp, url, stock_type, method)
+        return _format_ri_preferred(item, detail, corp, url, stock_type, method)
     if is_public:
-        return _format_ri_public(item, detail, market, corp, url, stock_type, method)
+        return _format_ri_public(item, detail, corp, url, stock_type, method)
     return None
 
 
-def _format_ri_preferred(item, detail, market, corp, url, stock_type, method):
-    """종류주 유상증자 (사모 메자닌)"""
-    new_shares = fmt_num(safe_get(detail, "nstk_ostk_cnt", "nstk_cnt"))
-    total_amount = fmt_amount(safe_get(detail, "fdpp_amount", "nstk_total_isstkamt"))
-    capital_ratio = fmt_pct(safe_get(detail, "ratlst_isstkrt", "tisstk_rt"))
-    conv_price = fmt_num(safe_get(detail, "nstk_isstk_pr", "nstk_iss_prc"))
+def _format_ri_preferred(item, detail, corp, url, stock_type, method):
+    """종류주 유상증자"""
+    rcept_dt = item.get("rcept_dt", "")
+    rcept_tm = item.get("rcept_tm", "")
+    rcept_no = item["rcept_no"]
+    corp_code = item.get("corp_code", "")
     
-    refix = safe_get(detail, "act_mktprcdv_lwlmt", "rfix_lwlmt")
-    refix_str = f"{refix}%" if refix != "-" else "-"
+    amount = fmt_amount(safe_get(detail, "fdpp_amount"))
+    price_ref_date = get_price_ref_date(rcept_dt, rcept_tm)
+    stock_data = fetch_stock_price_and_mktcap(corp_code, price_ref_date, DART_KEY)
+    mkt_cap_str = fmt_market_cap(stock_data["market_cap"])
+    close_price_str = fmt_close_price(stock_data["close_price"])
     
-    put_opt = safe_get(detail, "rpcmt_opt_ow_int_dts", "rpcmtad_pym")
-    call_opt = safe_get(detail, "spcmt_opt_ow_int_dts", "spcmtad_pym")
+    parsed = parse_disclosure_details(rcept_no)
     
-    # YTC
-    ytc = safe_get(detail, "spcmt_intr", "spcmt_intr_rt", "ytc")
-    ytc_str = f"{ytc}%" if ytc != "-" else "-"
+    new_shares = fmt_num(safe_get(detail, "nstk_ostk_cnt"))
+    conv_price = fmt_num(safe_get(detail, "nstk_isstk_pr"))
     
-    purpose = safe_get(detail, "fdpp_fclt", "fdpp_op", "use_purps")
     board_date = fmt_date(safe_get(detail, "bddd"))
     pay_date = fmt_date(safe_get(detail, "pymd"))
-    target = safe_get(detail, "thrd_pps_corp_nm", "thrd_pps_asstd", "atn_nm")
     
     return (
-        f"✅[{market}] 유상증자 결정 ({method})\n\n"
-        f"* 기업명: {corp}\n"
-        f"* 신주의 종류: {stock_type}\n\n"
-        f"* 발행금액: {total_amount}\n"
-        f"* 이사회결의일: {board_date}\n"
-        f"* 납입일: {pay_date}\n"
-        f"* 신주 수: {new_shares}주 (증자비율 {capital_ratio})\n"
-        f"* 전환가액: {conv_price}원\n"
-        f"* Refixing: {refix_str}\n"
-        f"* Put Option: {put_opt}\n"
-        f"* Call Option: {call_opt}\n"
-        f"* YTC: {ytc_str}\n"
-        f"* 자금조달목적: {purpose}\n"
-        f"* 배정 대상자: {target}\n\n"
+        f"✅주요사항보고서(유상증자결정)\n"
+        f"기업명: {corp} (시가총액 {mkt_cap_str}억원)\n"
+        f"신주의 종류: {stock_type}\n"
+        f"발행금액: {amount}\n"
+        f"전환가액: {conv_price}원 ({price_ref_date} 종가 {close_price_str}원)\n"
+        f"주식총수 대비 비율: {parsed['capital_ratio']}\n\n"
+        f"신주 수: {new_shares}주\n"
+        f"이사회결의일: {board_date}\n"
+        f"납입일: {pay_date}\n\n"
+        f"Coupon/YTM: -\n"
+        f"Refixing: {parsed['refixing']}\n"
+        f"Put Option: {parsed['put_option']}\n"
+        f"Call Option: {parsed['call_option']}\n"
+        f"Call 비율: {parsed['call_ratio']}\n"
+        f"YTC: {parsed['ytc']}\n"
+        f"인수인: {parsed['underwriters']}\n\n"
         f"🔗 {url}"
     )
 
 
-def _format_ri_public(item, detail, market, corp, url, stock_type, method):
+def _format_ri_public(item, detail, corp, url, stock_type, method):
     """공모 유상증자"""
-    new_shares = fmt_num(safe_get(detail, "nstk_ostk_cnt", "nstk_cnt"))
-    total_amount = fmt_amount(safe_get(detail, "fdpp_amount", "nstk_total_isstkamt"))
-    capital_ratio = fmt_pct(safe_get(detail, "ratlst_isstkrt", "tisstk_rt"))
-    issue_price = fmt_num(safe_get(detail, "nstk_isstk_pr", "nstk_iss_prc"))
+    rcept_dt = item.get("rcept_dt", "")
+    rcept_tm = item.get("rcept_tm", "")
+    rcept_no = item["rcept_no"]
+    corp_code = item.get("corp_code", "")
     
-    assign_per_share = safe_get(detail, "nstk_asstd_stkcnt", "ostk_asstd_cnt")
+    amount = fmt_amount(safe_get(detail, "fdpp_amount"))
+    price_ref_date = get_price_ref_date(rcept_dt, rcept_tm)
+    stock_data = fetch_stock_price_and_mktcap(corp_code, price_ref_date, DART_KEY)
+    mkt_cap_str = fmt_market_cap(stock_data["market_cap"])
+    close_price_str = fmt_close_price(stock_data["close_price"])
+    
+    parsed = parse_disclosure_details(rcept_no)
+    
+    new_shares = fmt_num(safe_get(detail, "nstk_ostk_cnt"))
+    issue_price = fmt_num(safe_get(detail, "nstk_isstk_pr"))
     
     board_date = fmt_date(safe_get(detail, "bddd"))
     pay_date = fmt_date(safe_get(detail, "pymd"))
-    listing_date = fmt_date(safe_get(detail, "nstk_lstd_pd", "nstk_lstmsd"))
+    listing_date = fmt_date(safe_get(detail, "nstk_lstd_pd"))
     
-    osh_sub_start = fmt_date(safe_get(detail, "osh_sbd_st_dt", "exrgt_sbd_st_dt"))
-    osh_sub_end = fmt_date(safe_get(detail, "osh_sbd_ed_dt", "exrgt_sbd_ed_dt"))
+    osh_sub_start = fmt_date(safe_get(detail, "osh_sbd_st_dt"))
+    osh_sub_end = fmt_date(safe_get(detail, "osh_sbd_ed_dt"))
     osh_sub = f"{osh_sub_start}~{osh_sub_end}" if osh_sub_start != "-" else "-"
     
-    gnrl_sub_start = fmt_date(safe_get(detail, "gnrl_sbd_st_dt", "fail_sbd_st_dt"))
-    gnrl_sub_end = fmt_date(safe_get(detail, "gnrl_sbd_ed_dt", "fail_sbd_ed_dt"))
+    gnrl_sub_start = fmt_date(safe_get(detail, "gnrl_sbd_st_dt"))
+    gnrl_sub_end = fmt_date(safe_get(detail, "gnrl_sbd_ed_dt"))
     gnrl_sub = f"{gnrl_sub_start}~{gnrl_sub_end}" if gnrl_sub_start != "-" else "-"
-    
-    underwriter = safe_get(detail, "rs_atn", "atn_nm", "und_nm")
-    purpose = safe_get(detail, "fdpp_fclt", "fdpp_op", "use_purps")
     
     new_shares_str = f"{stock_type} {new_shares}주" if stock_type != "-" else f"{new_shares}주"
     
     return (
-        f"✅[{market}] 유상증자 결정 (공모)\n\n"
-        f"* 기업명: {corp}\n"
-        f"* 증자방식: {method}\n"
-        f"* 발행금액: {total_amount}\n"
-        f"* 신주의 종류와 수: {new_shares_str} (증자비율 {capital_ratio})\n"
-        f"* 1주당 신주배정주식수: {assign_per_share}\n"
-        f"* 예정 발행가액: {issue_price}원\n"
-        f"* 이사회결의일: {board_date}\n"
-        f"* 구주주청약: {osh_sub}\n"
-        f"* 일반공모청약: {gnrl_sub}\n"
-        f"* 납입일: {pay_date}\n"
-        f"* 신주상장예정일: {listing_date}\n"
-        f"* 대표주관회사: {underwriter}\n"
-        f"* 자금조달목적: {purpose}\n\n"
+        f"✅주요사항보고서(유상증자결정)\n"
+        f"기업명: {corp} (시가총액 {mkt_cap_str}억원)\n"
+        f"증자방식: {method}\n"
+        f"발행금액: {amount}\n"
+        f"신주의 종류와 수: {new_shares_str}\n"
+        f"예정 발행가액: {issue_price}원 ({price_ref_date} 종가 {close_price_str}원)\n"
+        f"주식총수 대비 비율: {parsed['capital_ratio']}\n\n"
+        f"이사회결의일: {board_date}\n"
+        f"구주주청약: {osh_sub}\n"
+        f"일반공모청약: {gnrl_sub}\n"
+        f"납입일: {pay_date}\n"
+        f"신주상장예정일: {listing_date}\n"
+        f"대표주관회사: {parsed['underwriters']}\n\n"
         f"🔗 {url}"
     )
 
 
 def format_message(item):
-    market = MARKET_MAP.get(item.get("corp_cls", ""), "기타")
     corp_code = item.get("corp_code", "")
     rcept_no = item.get("rcept_no", "")
     type_code = item["_type_code"]
@@ -458,9 +449,9 @@ def format_message(item):
     detail = fetch_detail(corp_code, rcept_no, type_code)
     
     if type_code == "RI":
-        return format_ri_message(item, detail, market)
+        return format_ri_message(item, detail)
     else:
-        return format_cb_message(item, detail, market)
+        return format_bond_message(item, detail)
 
 
 def send_telegram(text):
