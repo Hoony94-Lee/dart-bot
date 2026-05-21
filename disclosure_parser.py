@@ -270,9 +270,202 @@ def parse_refixing(text):
     return f"{ratio:.0f}%"
 
 
+def parse_dividend_rate(text):
+    """
+    우선주 우선배당률 추출
+    예: "우선배당률 1.0% 참가적 누적적" → "1.0%(참가적, 누적적)"
+    
+    공시 본문 패턴:
+    - "우선배당률(%) 1.0" 또는 "우선배당율 1.0%"
+    - "참가적/비참가적", "누적적/비누적적" 별도 항목으로 표기
+    """
+    if not text:
+        return "-"
+    
+    # 우선배당률 추출
+    rate = None
+    patterns = [
+        r"우선배당률\s*\(?\s*%?\s*\)?\s*([0-9]+(?:\.[0-9]+)?)",
+        r"우선배당율\s*\(?\s*%?\s*\)?\s*([0-9]+(?:\.[0-9]+)?)",
+        r"배당률\s*\(?\s*%?\s*\)?\s*([0-9]+(?:\.[0-9]+)?)\s*%",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            try:
+                rate = float(m.group(1))
+                if rate > 0:
+                    break
+            except ValueError:
+                continue
+    
+    if rate is None or rate == 0:
+        return "-"
+    
+    rate_str = f"{rate:.1f}%"
+    
+    # 참가적/비참가적, 누적적/비누적적 속성 추출
+    attrs = []
+    if re.search(r"(?<!비)참가적", text):
+        attrs.append("참가적")
+    elif "비참가적" in text:
+        attrs.append("비참가적")
+    
+    if re.search(r"(?<!비)누적적", text):
+        attrs.append("누적적")
+    elif "비누적적" in text:
+        attrs.append("비누적적")
+    
+    if attrs:
+        return f"{rate_str}({', '.join(attrs)})"
+    return rate_str
+
+
+def parse_redemption_rate(text):
+    """
+    상환이율(RCPS/RPS) 추출
+    예: "상환이자율 2.0%" 또는 "상환수익률 연 복리 2.0%" → "2.0%"
+    
+    공시 본문 패턴:
+    - "상환이자율(%)"
+    - "상환수익률 연 X% 복리"
+    - "조기상환수익률" (상환우선주의 상환 조건)
+    """
+    if not text:
+        return "-"
+    
+    patterns = [
+        r"상환이자율\s*\(?\s*%?\s*\)?\s*([0-9]+(?:\.[0-9]+)?)",
+        r"상환수익률\s*(?:연\s*복리\s*)?([0-9]+(?:\.[0-9]+)?)\s*%",
+        r"조기상환수익률\s*(?:연\s*복리\s*)?([0-9]+(?:\.[0-9]+)?)\s*%",
+        r"상환\s*시\s*수익률\s*([0-9]+(?:\.[0-9]+)?)\s*%",
+        r"연\s*복리\s*([0-9]+(?:\.[0-9]+)?)\s*%의?\s*수익률.*?상환",
+    ]
+    
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            try:
+                val = float(m.group(1))
+                if val > 0:
+                    return f"{val:.1f}%"
+            except ValueError:
+                continue
+    
+    return "-"
+
+
+def parse_exchange_target(text):
+    """
+    교환사채(EB)의 교환대상주식 추출
+    
+    공시 본문 패턴:
+    - "교환대상 주식의 종류 자기주식" 또는 "교환대상 주식: OO기업 보통주"
+    - 표 형태: "교환대상 - 종류 - {주식명}"
+    """
+    if not text:
+        return "-"
+    
+    # 자기주식 우선 매칭
+    if re.search(r"자기주식.*?교환", text) or re.search(r"교환[^.]*?자기주식", text):
+        return "자기주식"
+    
+    # 회사명 + 보통주/우선주 패턴
+    patterns = [
+        # "교환대상 주식의 종류 {주식명}"
+        r"교환대상\s*주식의?\s*종류\s*[:：]?\s*([가-힣A-Za-z0-9㈜().\s]+?(?:보통주|우선주))",
+        # "교환대상 : {주식명}"
+        r"교환대상\s*[:：]\s*([가-힣A-Za-z0-9㈜().\s]+?(?:보통주|우선주))",
+        # "교환의 대상이 되는 주식 {주식명}"
+        r"교환의?\s*대상(?:이\s*되는)?\s*주식\s*[:：]?\s*([가-힣A-Za-z0-9㈜().\s]+?(?:보통주|우선주))",
+        # 표 형태: "교환대상 주식 {주식명}"
+        r"교환대상\s*주식\s+([가-힣A-Za-z0-9㈜()]+(?:\s+(?:보통주|우선주)))",
+    ]
+    
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            raw = m.group(1).strip()
+            raw = re.sub(r"\s+", " ", raw)
+            raw = raw.replace("㈜", "").replace("주식회사", "").strip()
+            if len(raw) > 50:
+                raw = raw[:50] + "..."
+            return raw if raw else "-"
+    
+    return "-"
+
+
+def parse_premium_rate(text):
+    """
+    교환사채/전환사채 할증률 추출
+    예: "기준주가에 10% 할증" → "10.0%"
+    
+    공시 본문 패턴:
+    - "할증률(%) 10" 또는 "할증율 10%"  
+    - "기준주가 대비 N% 할증"
+    - "산술평균가액에 N%를 가산"
+    """
+    if not text:
+        return "-"
+    
+    patterns = [
+        r"할증률\s*\(?\s*%?\s*\)?\s*([0-9]+(?:\.[0-9]+)?)",
+        r"할증율\s*\(?\s*%?\s*\)?\s*([0-9]+(?:\.[0-9]+)?)",
+        r"([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:를|을)?\s*(?:할증|가산)",
+        r"(?:할증|가산)\s*(?:한|하여)?\s*([0-9]+(?:\.[0-9]+)?)\s*%",
+        r"기준주가\s*대비\s*([0-9]+(?:\.[0-9]+)?)\s*%",
+    ]
+    
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            try:
+                val = float(m.group(1))
+                if val == 0:
+                    return "-"
+                return f"{val:.1f}%"
+            except ValueError:
+                continue
+    
+    return "-"
+
+
+def parse_discount_rate(text):
+    """
+    공모 유상증자 할인율 추출
+    예: "할인율(%) 25" 또는 "할인율 25%" → "25%"
+    
+    공시 본문 양식: 
+    "신주발행가액" 표에 "할인율(또는 할증율)(%)" 항목으로 표기됨
+    """
+    if not text:
+        return "-"
+    
+    # 패턴: "할인율" 다음 숫자
+    patterns = [
+        r"할인율\s*\(?\s*%?\s*\)?\s*(?:또는\s*할증율\s*\(?\s*%?\s*\)?)?\s*([0-9]+(?:\.[0-9]+)?)",
+        r"할증율\s*\(?\s*%?\s*\)?\s*(?:또는\s*할인율\s*\(?\s*%?\s*\)?)?\s*([0-9]+(?:\.[0-9]+)?)",
+        r"할인율\s*([0-9]+(?:\.[0-9]+)?)\s*%",
+    ]
+    
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            try:
+                val = float(m.group(1))
+                # 0이면 할인 없음
+                if val == 0:
+                    return "-"
+                return f"{val:.1f}%"
+            except ValueError:
+                continue
+    
+    return "-"
+
+
 def parse_underwriters(text):
     """
-    인수인 (집합투자업자 = 운용사명) 추출
+    사모 메자닌 인수인 (집합투자업자 = 운용사명) 추출
     예: "코리아자산운용 주식회사, 르퓨쳐자산운용 주식회사" → "코리아자산운용, 르퓨쳐자산운용"
     """
     if not text:
@@ -309,6 +502,70 @@ def parse_underwriters(text):
     return ", ".join(unique)
 
 
+def parse_lead_managers(text):
+    """
+    공모 유상증자 대표주관회사 추출
+    
+    공시 본문에서 "대표주관회사" 컬럼/라인의 증권사명 추출.
+    예: "한국투자증권, 미래에셋증권" → "한국투자증권, 미래에셋증권"
+    
+    공동 대표주관회사가 여러 곳인 경우도 모두 추출.
+    """
+    if not text:
+        return "-"
+    
+    # 1차: "대표주관회사" 키워드 다음 텍스트 영역
+    # 패턴: "대표주관회사 OOO증권" 형태 (다음 키워드까지)
+    next_keywords = (
+        r"(?:인수인|모집주선|공동주관|일반공모|청약\s*개시|"
+        r"\d+\.\s|\d+\)\s|증자방식|신주의\s*종류|발행\s*가액|"
+        r"모집매출\s*방법|기타|【|《|■)"
+    )
+    
+    patterns = [
+        # "대표주관회사 [공동] : OOO증권, XXX증권"
+        rf"대표주관회사\s*(?:\(공동\)|공동)?\s*[:：]?\s*([^\n]{{1,200}}?)(?=\s*{next_keywords})",
+        # "대표주관회사 OOO증권" (단순)
+        rf"대표주관회사\s+([가-힣A-Za-z㈜()0-9,\s\.]{{2,200}}?)(?={next_keywords})",
+    ]
+    
+    raw_text = None
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            raw_text = m.group(1).strip()
+            if raw_text and raw_text != "-":
+                break
+    
+    if not raw_text or raw_text == "-":
+        return "-"
+    
+    # 증권사명 추출 (한글 + "증권" 패턴)
+    # "한국투자증권㈜" → "한국투자증권"
+    # "NH투자증권 주식회사" → "NH투자증권"
+    securities_pattern = r"([가-힣A-Za-z]+(?:투자)?증권)(?:\s*(?:주식회사|㈜|\(주\)))?"
+    matches = re.findall(securities_pattern, raw_text)
+    
+    if not matches:
+        # 증권사 패턴 매칭 안되면 원본 텍스트 일부 반환
+        cleaned = re.sub(r"\s+", " ", raw_text).strip()
+        cleaned = cleaned.rstrip(",").strip()
+        # 너무 길면 자르기
+        if len(cleaned) > 100:
+            cleaned = cleaned[:100] + "..."
+        return cleaned if cleaned else "-"
+    
+    # 중복 제거 (순서 유지)
+    seen = set()
+    unique = []
+    for name in matches:
+        if name not in seen:
+            seen.add(name)
+            unique.append(name)
+    
+    return ", ".join(unique)
+
+
 # ───────────────────────────────────────
 # 통합 함수
 # ───────────────────────────────────────
@@ -335,6 +592,12 @@ def parse_disclosure_details(rcept_no):
         "ytc": "-",
         "refixing": "-",
         "underwriters": "-",
+        "discount_rate": "-",
+        "lead_managers": "-",
+        "dividend_rate": "-",
+        "redemption_rate": "-",
+        "exchange_target": "-",
+        "premium_rate": "-",
     }
     
     text = fetch_disclosure_text(rcept_no)
@@ -375,6 +638,36 @@ def parse_disclosure_details(rcept_no):
         result["underwriters"] = parse_underwriters(text)
     except Exception as e:
         print(f"underwriters 파싱 실패: {e}")
+    
+    try:
+        result["discount_rate"] = parse_discount_rate(text)
+    except Exception as e:
+        print(f"discount_rate 파싱 실패: {e}")
+    
+    try:
+        result["lead_managers"] = parse_lead_managers(text)
+    except Exception as e:
+        print(f"lead_managers 파싱 실패: {e}")
+    
+    try:
+        result["dividend_rate"] = parse_dividend_rate(text)
+    except Exception as e:
+        print(f"dividend_rate 파싱 실패: {e}")
+    
+    try:
+        result["redemption_rate"] = parse_redemption_rate(text)
+    except Exception as e:
+        print(f"redemption_rate 파싱 실패: {e}")
+    
+    try:
+        result["exchange_target"] = parse_exchange_target(text)
+    except Exception as e:
+        print(f"exchange_target 파싱 실패: {e}")
+    
+    try:
+        result["premium_rate"] = parse_premium_rate(text)
+    except Exception as e:
+        print(f"premium_rate 파싱 실패: {e}")
     
     return result
 
