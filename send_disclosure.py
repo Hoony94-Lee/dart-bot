@@ -71,15 +71,13 @@ def save_sent(sent):
 # 유틸리티
 # ───────────────────────────────────────
 def fmt_amount(value):
-    """금액을 억원 단위로 포맷"""
+    """금액을 억원 단위로 포맷 (정수 형태, 예: 50억원)"""
     try:
         v = int(str(value).replace(",", "").replace("-", "0"))
         if v == 0:
             return "-"
         uk = v / 100000000
-        if uk >= 100:
-            return f"{uk:,.0f}억원"
-        return f"{uk:,.1f}억원"
+        return f"{uk:,.0f}억원"
     except (ValueError, TypeError):
         return str(value) if value else "-"
 
@@ -145,6 +143,17 @@ def get_price_ref_date(rcept_dt, rcept_tm):
             return prev_date.strftime("%Y-%m-%d")
     except (ValueError, TypeError):
         return "-"
+
+
+def fmt_short_date(date_str):
+    """YYYY-MM-DD → M/D 형식 변환 (예: 2026-05-20 → 5/20)"""
+    if not date_str or date_str == "-":
+        return "-"
+    try:
+        date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+        return f"{date_obj.month}/{date_obj.day}"
+    except (ValueError, TypeError):
+        return date_str
 
 
 # ───────────────────────────────────────
@@ -264,8 +273,15 @@ def format_bond_message(item, detail):
         "BW": "신주인수권부사채발행결정",
         "EB": "교환사채발행결정",
     }
+    # 가격 항목 라벨 분기
+    price_label_map = {
+        "CB": "전환가액",
+        "BW": "행사가액",
+        "EB": "교환가액",
+    }
     type_code = item["_type_code"]
     title_name = type_map[type_code]
+    price_label = price_label_map[type_code]
     
     corp = item["corp_name"]
     rcept_no = item["rcept_no"]
@@ -291,7 +307,7 @@ def format_bond_message(item, detail):
     mkt_cap_str = fmt_market_cap(stock_data["market_cap"])
     close_price_str = fmt_close_price(stock_data["close_price"])
     
-    # 공시 본문 파싱 (주식총수 대비 비율, Put/Call, Refixing, 인수인)
+    # 공시 본문 파싱 (주식총수 대비 비율, Put/Call, Refixing, 인수인 등)
     parsed = parse_disclosure_details(rcept_no)
     
     # 발행 스케줄
@@ -307,12 +323,26 @@ def format_bond_message(item, detail):
     ytm = safe_get(detail, "bd_intr_sf")
     coupon_str = f"{coupon}% / {ytm}%" if coupon != "-" or ytm != "-" else "-"
     
+    # 가격 섹션 (EB는 할증률 + 교환대상주식 추가)
+    if type_code == "EB":
+        price_section = (
+            f"발행금액: {amount}\n"
+            f"{price_label}: {exec_price}원 ({fmt_short_date(price_ref_date)} 종가 {close_price_str}원)\n"
+            f"할증률: {parsed['premium_rate']}\n"
+            f"교환대상주식: {parsed['exchange_target']}\n"
+            f"주식총수 대비 비율: {parsed['capital_ratio']}"
+        )
+    else:
+        price_section = (
+            f"발행금액: {amount}\n"
+            f"{price_label}: {exec_price}원 ({fmt_short_date(price_ref_date)} 종가 {close_price_str}원)\n"
+            f"주식총수 대비 비율: {parsed['capital_ratio']}"
+        )
+    
     return (
         f"✅주요사항보고서({title_name})\n"
         f"기업명: {corp} (시가총액 {mkt_cap_str}억원)\n"
-        f"발행금액: {amount}\n"
-        f"행사가액: {exec_price}원 ({price_ref_date} 종가 {close_price_str}원)\n"
-        f"주식총수 대비 비율: {parsed['capital_ratio']}\n\n"
+        f"{price_section}\n\n"
         f"이사회결의일: {board_date}\n"
         f"발행일: {issue_date}\n"
         f"만기일: {maturity_date}\n\n"
@@ -350,7 +380,13 @@ def format_ri_message(item, detail):
 
 
 def _format_ri_preferred(item, detail, corp, url, stock_type, method):
-    """종류주 유상증자"""
+    """
+    종류주 유상증자 (CPS, RCPS, CRPS, RPS)
+    
+    표시 항목:
+    - 공통: 우선배당률, Refixing, Call Option, Call 비율, YTC, 인수인
+    - RCPS/RPS만: Put Option, 상환이율 (상환권이 있는 우선주)
+    """
     rcept_dt = item.get("rcept_dt", "")
     rcept_tm = item.get("rcept_tm", "")
     rcept_no = item["rcept_no"]
@@ -364,29 +400,52 @@ def _format_ri_preferred(item, detail, corp, url, stock_type, method):
     
     parsed = parse_disclosure_details(rcept_no)
     
-    new_shares = fmt_num(safe_get(detail, "nstk_ostk_cnt"))
     conv_price = fmt_num(safe_get(detail, "nstk_isstk_pr"))
     
     board_date = fmt_date(safe_get(detail, "bddd"))
     pay_date = fmt_date(safe_get(detail, "pymd"))
+    
+    # 상환권 있는 우선주 판정 (RCPS, RPS, 상환전환우선주, 상환우선주 등)
+    has_redemption = any(kw in stock_type for kw in [
+        "상환전환우선주",
+        "전환상환우선주",
+        "상환우선주",
+        "RCPS",
+        "RPS",
+    ])
+    
+    # 상환권 있는 경우에만 Put Option + 상환이율 표시
+    if has_redemption:
+        redemption_section = (
+            f"우선배당률: {parsed['dividend_rate']}\n"
+            f"Refixing: {parsed['refixing']}\n"
+            f"Put Option: {parsed['put_option']}\n"
+            f"상환이율: {parsed['redemption_rate']}\n"
+            f"Call Option: {parsed['call_option']}\n"
+            f"Call 비율: {parsed['call_ratio']}\n"
+            f"YTC: {parsed['ytc']}\n"
+            f"인수인: {parsed['underwriters']}"
+        )
+    else:
+        redemption_section = (
+            f"우선배당률: {parsed['dividend_rate']}\n"
+            f"Refixing: {parsed['refixing']}\n"
+            f"Call Option: {parsed['call_option']}\n"
+            f"Call 비율: {parsed['call_ratio']}\n"
+            f"YTC: {parsed['ytc']}\n"
+            f"인수인: {parsed['underwriters']}"
+        )
     
     return (
         f"✅주요사항보고서(유상증자결정)\n"
         f"기업명: {corp} (시가총액 {mkt_cap_str}억원)\n"
         f"신주의 종류: {stock_type}\n"
         f"발행금액: {amount}\n"
-        f"전환가액: {conv_price}원 ({price_ref_date} 종가 {close_price_str}원)\n"
+        f"전환가액: {conv_price}원 ({fmt_short_date(price_ref_date)} 종가 {close_price_str}원)\n"
         f"주식총수 대비 비율: {parsed['capital_ratio']}\n\n"
-        f"신주 수: {new_shares}주\n"
         f"이사회결의일: {board_date}\n"
         f"납입일: {pay_date}\n\n"
-        f"Coupon/YTM: -\n"
-        f"Refixing: {parsed['refixing']}\n"
-        f"Put Option: {parsed['put_option']}\n"
-        f"Call Option: {parsed['call_option']}\n"
-        f"Call 비율: {parsed['call_ratio']}\n"
-        f"YTC: {parsed['ytc']}\n"
-        f"인수인: {parsed['underwriters']}\n\n"
+        f"{redemption_section}\n\n"
         f"🔗 {url}"
     )
 
@@ -415,11 +474,11 @@ def _format_ri_public(item, detail, corp, url, stock_type, method):
     
     osh_sub_start = fmt_date(safe_get(detail, "osh_sbd_st_dt"))
     osh_sub_end = fmt_date(safe_get(detail, "osh_sbd_ed_dt"))
-    osh_sub = f"{osh_sub_start}~{osh_sub_end}" if osh_sub_start != "-" else "-"
+    osh_sub = f"{osh_sub_start} ~ {osh_sub_end}" if osh_sub_start != "-" else "-"
     
     gnrl_sub_start = fmt_date(safe_get(detail, "gnrl_sbd_st_dt"))
     gnrl_sub_end = fmt_date(safe_get(detail, "gnrl_sbd_ed_dt"))
-    gnrl_sub = f"{gnrl_sub_start}~{gnrl_sub_end}" if gnrl_sub_start != "-" else "-"
+    gnrl_sub = f"{gnrl_sub_start} ~ {gnrl_sub_end}" if gnrl_sub_start != "-" else "-"
     
     new_shares_str = f"{stock_type} {new_shares}주" if stock_type != "-" else f"{new_shares}주"
     
@@ -429,14 +488,15 @@ def _format_ri_public(item, detail, corp, url, stock_type, method):
         f"증자방식: {method}\n"
         f"발행금액: {amount}\n"
         f"신주의 종류와 수: {new_shares_str}\n"
-        f"예정 발행가액: {issue_price}원 ({price_ref_date} 종가 {close_price_str}원)\n"
-        f"주식총수 대비 비율: {parsed['capital_ratio']}\n\n"
+        f"예정 발행가액: {issue_price}원 ({fmt_short_date(price_ref_date)} 종가 {close_price_str}원)\n"
+        f"주식총수 대비 비율: {parsed['capital_ratio']}\n"
+        f"할인율: {parsed['discount_rate']}\n\n"
         f"이사회결의일: {board_date}\n"
         f"구주주청약: {osh_sub}\n"
         f"일반공모청약: {gnrl_sub}\n"
         f"납입일: {pay_date}\n"
         f"신주상장예정일: {listing_date}\n"
-        f"대표주관회사: {parsed['underwriters']}\n\n"
+        f"대표주관회사: {parsed['lead_managers']}\n\n"
         f"🔗 {url}"
     )
 
