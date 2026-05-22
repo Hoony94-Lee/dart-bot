@@ -244,42 +244,68 @@ def fetch_detail(corp_code, rcept_no, type_code):
         return None
     
     kst = ZoneInfo("Asia/Seoul")
-    end_de = datetime.now(kst).strftime("%Y%m%d")
-    bgn_de = (datetime.now(kst) - timedelta(days=2)).strftime("%Y%m%d")
     
-    res = requests.get(
-        f"https://opendart.fss.or.kr/api/{endpoint}.json",
-        params={
-            "crtfc_key": DART_KEY,
-            "corp_code": corp_code,
-            "bgn_de": bgn_de,
-            "end_de": end_de,
-        },
-        timeout=30,
-    ).json()
-    
-    if res.get("status") != "000":
-        if type_code == "RI":
-            res = requests.get(
-                "https://opendart.fss.or.kr/api/pifricDecsn.json",
+    def _call_api(ep, bgn, end):
+        """엔드포인트 호출 헬퍼"""
+        try:
+            r = requests.get(
+                f"https://opendart.fss.or.kr/api/{ep}.json",
                 params={
                     "crtfc_key": DART_KEY,
                     "corp_code": corp_code,
-                    "bgn_de": bgn_de,
-                    "end_de": end_de,
+                    "bgn_de": bgn,
+                    "end_de": end,
                 },
                 timeout=30,
-            ).json()
-            if res.get("status") != "000":
-                return None
-        else:
-            return None
+            )
+            return r.json()
+        except Exception as e:
+            print(f"DART API 호출 실패 ({ep}): {e}")
+            return {"status": "999", "list": []}
     
-    items = res.get("list", [])
+    # 1차: ±2일 범위 조회
+    end_de = datetime.now(kst).strftime("%Y%m%d")
+    bgn_de = (datetime.now(kst) - timedelta(days=2)).strftime("%Y%m%d")
+    
+    res = _call_api(endpoint, bgn_de, end_de)
+    
+    # RI인 경우 piicDecsn 실패 시 pifricDecsn 시도
+    if res.get("status") != "000" and type_code == "RI":
+        res = _call_api("pifricDecsn", bgn_de, end_de)
+    
+    # 1차 매칭 시도
+    items = res.get("list", []) if res.get("status") == "000" else []
     for item in items:
         if item.get("rcept_no") == rcept_no:
             return item
-    return items[0] if items else None
+    
+    # 2차: ±7일 범위 재조회 (rcept_no 불일치 또는 API 동기화 지연 대응)
+    print(f"1차 매칭 실패 - ±7일 재조회 시도 (rcept_no={rcept_no})")
+    bgn_ext = (datetime.now(kst) - timedelta(days=7)).strftime("%Y%m%d")
+    end_ext = (datetime.now(kst) + timedelta(days=1)).strftime("%Y%m%d")
+    
+    res2 = _call_api(endpoint, bgn_ext, end_ext)
+    if res2.get("status") != "000" and type_code == "RI":
+        res2 = _call_api("pifricDecsn", bgn_ext, end_ext)
+    
+    items2 = res2.get("list", []) if res2.get("status") == "000" else []
+    
+    # rcept_no 정확히 매칭 우선
+    for item in items2:
+        if item.get("rcept_no") == rcept_no:
+            return item
+    
+    # 매칭 안 되면 가장 최근 건 사용 (fallback)
+    if items2:
+        print(f"  재조회 fallback: 가장 최근 건 사용 ({items2[-1].get('rcept_no')})")
+        return items2[-1]
+    
+    # 1차 결과라도 있으면 fallback
+    if items:
+        print(f"  1차 fallback: 가장 최근 건 사용 ({items[-1].get('rcept_no')})")
+        return items[-1]
+    
+    return None
 
 
 # ───────────────────────────────────────
