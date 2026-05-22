@@ -241,37 +241,53 @@ def fetch_detail(corp_code, rcept_no, type_code):
     }
     endpoint = endpoints.get(type_code)
     if not endpoint:
+        print(f"[fetch_detail] 알 수 없는 type_code: {type_code}")
         return None
     
     kst = ZoneInfo("Asia/Seoul")
     
-    def _call_api(ep, bgn, end):
-        """엔드포인트 호출 헬퍼"""
-        try:
-            r = requests.get(
-                f"https://opendart.fss.or.kr/api/{ep}.json",
-                params={
-                    "crtfc_key": DART_KEY,
-                    "corp_code": corp_code,
-                    "bgn_de": bgn,
-                    "end_de": end,
-                },
-                timeout=30,
-            )
-            return r.json()
-        except Exception as e:
-            print(f"DART API 호출 실패 ({ep}): {e}")
-            return {"status": "999", "list": []}
+    def _call_api(ep, bgn, end, max_retries=3):
+        """엔드포인트 호출 헬퍼 (재시도 포함)"""
+        import time
+        for attempt in range(max_retries):
+            try:
+                r = requests.get(
+                    f"https://opendart.fss.or.kr/api/{ep}.json",
+                    params={
+                        "crtfc_key": DART_KEY,
+                        "corp_code": corp_code,
+                        "bgn_de": bgn,
+                        "end_de": end,
+                    },
+                    timeout=30,
+                )
+                try:
+                    return r.json()
+                except Exception as e:
+                    print(f"[fetch_detail] {ep} JSON 파싱 실패 (시도 {attempt+1}): {e} / 응답: {r.text[:200]}")
+                    if attempt < max_retries - 1:
+                        time.sleep(2)
+                        continue
+                    return {"status": "998", "list": []}
+            except Exception as e:
+                print(f"[fetch_detail] {ep} 호출 실패 (시도 {attempt+1}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+                    continue
+                return {"status": "999", "list": []}
+        return {"status": "997", "list": []}
     
     # 1차: ±2일 범위 조회
     end_de = datetime.now(kst).strftime("%Y%m%d")
     bgn_de = (datetime.now(kst) - timedelta(days=2)).strftime("%Y%m%d")
     
     res = _call_api(endpoint, bgn_de, end_de)
+    print(f"[fetch_detail] {type_code} 1차 조회: status={res.get('status')}, 건수={len(res.get('list', []))}")
     
     # RI인 경우 piicDecsn 실패 시 pifricDecsn 시도
     if res.get("status") != "000" and type_code == "RI":
         res = _call_api("pifricDecsn", bgn_de, end_de)
+        print(f"[fetch_detail] RI pifricDecsn 시도: status={res.get('status')}")
     
     # 1차 매칭 시도
     items = res.get("list", []) if res.get("status") == "000" else []
@@ -279,12 +295,14 @@ def fetch_detail(corp_code, rcept_no, type_code):
         if item.get("rcept_no") == rcept_no:
             return item
     
-    # 2차: ±7일 범위 재조회 (rcept_no 불일치 또는 API 동기화 지연 대응)
-    print(f"1차 매칭 실패 - ±7일 재조회 시도 (rcept_no={rcept_no})")
+    # 2차: ±7일 범위 재조회
+    print(f"[fetch_detail] 1차 매칭 실패 - ±7일 재조회 (corp={corp_code}, rcept={rcept_no})")
     bgn_ext = (datetime.now(kst) - timedelta(days=7)).strftime("%Y%m%d")
     end_ext = (datetime.now(kst) + timedelta(days=1)).strftime("%Y%m%d")
     
     res2 = _call_api(endpoint, bgn_ext, end_ext)
+    print(f"[fetch_detail] 2차 조회: status={res2.get('status')}, 건수={len(res2.get('list', []))}")
+    
     if res2.get("status") != "000" and type_code == "RI":
         res2 = _call_api("pifricDecsn", bgn_ext, end_ext)
     
@@ -297,14 +315,15 @@ def fetch_detail(corp_code, rcept_no, type_code):
     
     # 매칭 안 되면 가장 최근 건 사용 (fallback)
     if items2:
-        print(f"  재조회 fallback: 가장 최근 건 사용 ({items2[-1].get('rcept_no')})")
+        print(f"[fetch_detail] 2차 fallback: 가장 최근 건 사용 ({items2[-1].get('rcept_no')})")
         return items2[-1]
     
     # 1차 결과라도 있으면 fallback
     if items:
-        print(f"  1차 fallback: 가장 최근 건 사용 ({items[-1].get('rcept_no')})")
+        print(f"[fetch_detail] 1차 fallback: 가장 최근 건 사용 ({items[-1].get('rcept_no')})")
         return items[-1]
     
+    print(f"[fetch_detail] 최종 실패: 데이터 없음")
     return None
 
 
@@ -336,12 +355,8 @@ def format_bond_message(item, detail):
     url = f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcept_no}"
     
     if not detail:
-        return (
-            f"✅주요사항보고서({title_name})\n"
-            f"기업명: {corp}\n"
-            f"(상세 정보 조회 실패 - 원문 확인 필요)\n\n"
-            f"🔗 {url}"
-        )
+        print(f"[format_bond_message] detail이 None - sent 기록하지 않고 재시도 대기 ({rcept_no})")
+        return None
     
     # 기본정보
     amount = fmt_amount(safe_get(detail, "bd_fta"))
@@ -612,9 +627,17 @@ def main():
         try:
             msg = format_message(item)
             if msg is None:
-                print(f"스킵: {item['corp_name']}")
-                sent.add(item["rcept_no"])
-                skipped_count += 1
+                # 상세 조회 실패 또는 처리 대상 아닌 공시 (예: 제3자배정 보통주)
+                # 처리 대상 아닌 케이스만 sent에 기록하고, 일시 실패는 재시도되도록 sent에 추가하지 않음
+                type_code = item.get("_type_code", "")
+                if type_code == "RI":
+                    # 유상증자 중 처리 대상 아닌 케이스는 sent 기록 (재발송 방지)
+                    print(f"스킵 (RI 제외 대상): {item['corp_name']}")
+                    sent.add(item["rcept_no"])
+                    skipped_count += 1
+                else:
+                    # CB/BW/EB는 상세 조회 실패이므로 재시도 대기
+                    print(f"재시도 대기 (detail 실패): {item['corp_name']} - {item['rcept_no']}")
                 continue
             send_telegram(msg)
             sent.add(item["rcept_no"])
