@@ -40,18 +40,37 @@ HOLIDAY_FILE = "holidays.json"
 # 휴장일 / 발송기록
 # ───────────────────────────────────────
 def is_holiday():
+    """주말, 공휴일, 또는 영업시간 외 발송 차단"""
     kst = ZoneInfo("Asia/Seoul")
-    today = datetime.now(kst).strftime("%Y-%m-%d")
-    weekday = datetime.now(kst).weekday()
+    now = datetime.now(kst)
+    today = now.strftime("%Y-%m-%d")
+    weekday = now.weekday()
+    
+    # 주말 차단
     if weekday >= 5:
         print(f"오늘({today})은 주말. 발송 생략.")
         return True
+    
+    # 영업시간 차단 (KST 06:00 ~ 20:30)
+    hour = now.hour
+    minute = now.minute
+    current_minutes = hour * 60 + minute
+    
+    BUSINESS_START = 6 * 60        # 06:00
+    BUSINESS_END = 20 * 60 + 30    # 20:30
+    
+    if current_minutes < BUSINESS_START or current_minutes > BUSINESS_END:
+        print(f"현재 시각({now.strftime('%H:%M')})은 영업시간 외. 발송 생략.")
+        return True
+    
+    # 공휴일 차단
     if os.path.exists(HOLIDAY_FILE):
         with open(HOLIDAY_FILE) as f:
             holidays = json.load(f)
         if today in holidays:
             print(f"오늘({today})은 휴장일. 발송 생략.")
             return True
+    
     return False
 
 
@@ -307,16 +326,22 @@ def format_bond_message(item, detail):
     mkt_cap_str = fmt_market_cap(stock_data["market_cap"])
     close_price_str = fmt_close_price(stock_data["close_price"])
     
-    # 공시 본문 파싱 (주식총수 대비 비율, Put/Call, Refixing, 인수인 등)
-    parsed = parse_disclosure_details(rcept_no)
-    
     # 발행 스케줄
     board_date = fmt_date(safe_get(detail, "bddd"))
     issue_date = fmt_date(safe_get(detail, "pymd"))
     maturity_date = fmt_date(safe_get(detail, "bd_mtd"))
     
     # 가격 조건
-    exec_price = fmt_num(safe_get(detail, "cv_prc"))
+    exec_price_raw = safe_get(detail, "cv_prc")
+    exec_price = fmt_num(exec_price_raw)
+    try:
+        base_price = int(str(exec_price_raw).replace(",", "")) if exec_price_raw != "-" else None
+    except (ValueError, TypeError):
+        base_price = None
+    
+    # 공시 본문 파싱
+    pymd_str = safe_get(detail, "pymd")
+    parsed = parse_disclosure_details(DART_KEY, rcept_no, pymd_str, base_price)
     
     # 금리 조건
     coupon = safe_get(detail, "bd_intr_ex")
@@ -398,9 +423,15 @@ def _format_ri_preferred(item, detail, corp, url, stock_type, method):
     mkt_cap_str = fmt_market_cap(stock_data["market_cap"])
     close_price_str = fmt_close_price(stock_data["close_price"])
     
-    parsed = parse_disclosure_details(rcept_no)
+    conv_price_raw = safe_get(detail, "nstk_isstk_pr")
+    conv_price = fmt_num(conv_price_raw)
+    try:
+        base_price = int(str(conv_price_raw).replace(",", "")) if conv_price_raw != "-" else None
+    except (ValueError, TypeError):
+        base_price = None
     
-    conv_price = fmt_num(safe_get(detail, "nstk_isstk_pr"))
+    pymd_str = safe_get(detail, "pymd")
+    parsed = parse_disclosure_details(DART_KEY, rcept_no, pymd_str, base_price)
     
     board_date = fmt_date(safe_get(detail, "bddd"))
     pay_date = fmt_date(safe_get(detail, "pymd"))
@@ -463,10 +494,17 @@ def _format_ri_public(item, detail, corp, url, stock_type, method):
     mkt_cap_str = fmt_market_cap(stock_data["market_cap"])
     close_price_str = fmt_close_price(stock_data["close_price"])
     
-    parsed = parse_disclosure_details(rcept_no)
+    issue_price_raw = safe_get(detail, "nstk_isstk_pr")
+    issue_price = fmt_num(issue_price_raw)
+    try:
+        base_price = int(str(issue_price_raw).replace(",", "")) if issue_price_raw != "-" else None
+    except (ValueError, TypeError):
+        base_price = None
+    
+    pymd_str = safe_get(detail, "pymd")
+    parsed = parse_disclosure_details(DART_KEY, rcept_no, pymd_str, base_price)
     
     new_shares = fmt_num(safe_get(detail, "nstk_ostk_cnt"))
-    issue_price = fmt_num(safe_get(detail, "nstk_isstk_pr"))
     
     board_date = fmt_date(safe_get(detail, "bddd"))
     pay_date = fmt_date(safe_get(detail, "pymd"))
