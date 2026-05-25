@@ -1114,17 +1114,8 @@ def parse_disclosure_details(dart_key, rcept_no, pymd_str=None, base_price=None)
 
 if __name__ == "__main__":
     import os
-    dart_key = os.environ.get("DART_API_KEY", "f8a8d38311d5a3914032697a62b2ada1eb228624")
-    
-    test_cases = [
-        ("20260520000262", "20260528", 5424, "엔젯 BW"),
-        ("20260521000803", "20260528", 3875, "이엔플러스 CB"),
-        ("20260521800995", "20260529", 5350, "에이프로젠 CB"),
-        ("20260522000559", "20260610", 13070, "뉴라텍 CB"),
-    ]
-    
-    for rcept_no, pymd_str, base_price, name in test_cases:
-        print(f"\n=== {name} ({rcept_no}) ===")
-        result = parse_disclosure_details(dart_key, rcept_no, pymd_str, base_price)
-        for k, v in result.items():
-            print(f"  {k}: {v}")
+    dart_key = os.environ.get("DART_API_KEY", "")
+    if not dart_key:
+        print("DART_API_KEY 환경변수를 설정하십시오.")
+        exit(1)
+    # 테스트용 케이스는 필요시 직접 입력
