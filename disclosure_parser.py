@@ -70,22 +70,30 @@ def fetch_document_xml(dart_key, rcept_no):
         )
         r.raise_for_status()
         blob = r.content
+        print(f"[document.xml] rcept={rcept_no} 응답 크기: {len(blob)} bytes")
+        
         try:
             with zipfile.ZipFile(io.BytesIO(blob)) as zf:
                 names = sorted(zf.namelist(), key=lambda n: zf.getinfo(n).file_size, reverse=True)
                 if not names:
+                    print(f"[document.xml] ZIP 안 비어있음")
                     return ""
                 content = zf.read(names[0])
+                print(f"[document.xml] ZIP 내 가장 큰 파일: {names[0]} ({len(content)} bytes)")
         except zipfile.BadZipFile:
+            print(f"[document.xml] ZIP 아님 - 본문 그대로 사용 (응답 본문 일부: {blob[:200]})")
             content = blob
+        
         for enc in ("utf-8", "cp949", "euc-kr"):
             try:
-                return content.decode(enc)
+                decoded = content.decode(enc)
+                print(f"[document.xml] {enc} 디코딩 성공 (길이: {len(decoded)})")
+                return decoded
             except UnicodeDecodeError:
                 continue
         return content.decode("utf-8", errors="replace")
     except Exception as e:
-        print(f"document.xml 실패 rcept={rcept_no}: {e}")
+        print(f"[document.xml] 실패 rcept={rcept_no}: {e}")
         return ""
 
 
