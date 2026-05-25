@@ -5,12 +5,24 @@ import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from stock_data import (
-    fetch_stock_price_and_mktcap,
-    fmt_market_cap,
-    fmt_close_price,
-)
-from disclosure_parser import parse_disclosure_details
+# stock_data, disclosure_parser import 검증
+try:
+    from stock_data import (
+        fetch_stock_price_and_mktcap,
+        fmt_market_cap,
+        fmt_close_price,
+    )
+    print("[import] stock_data 정상 로드")
+except Exception as e:
+    print(f"[import] stock_data 실패: {e}")
+    raise
+
+try:
+    from disclosure_parser import parse_disclosure_details
+    print("[import] disclosure_parser 정상 로드")
+except Exception as e:
+    print(f"[import] disclosure_parser 실패: {e}")
+    raise
 
 DART_KEY = os.environ["DART_API_KEY"]
 TG_TOKEN = os.environ["TELEGRAM_TOKEN"]
