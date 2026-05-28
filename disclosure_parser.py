@@ -72,6 +72,15 @@ def fetch_document_xml(dart_key, rcept_no):
         blob = r.content
         print(f"[document.xml] rcept={rcept_no} 응답 크기: {len(blob)} bytes")
         
+        # ZIP이 아닌 경우 = DART 에러 응답(XML)
+        # status 014 = "파일을 조회하였으나 해당 데이터가 없음" (공시 직후 원문 미생성)
+        if blob[:2] != b"PK":  # ZIP 시그니처(PK)가 아니면
+            head = blob[:500].decode("utf-8", errors="replace")
+            status_m = re.search(r"<status>(\d+)</status>", head)
+            status_code = status_m.group(1) if status_m else "?"
+            print(f"[document.xml] 원문 미생성/에러 (status={status_code}) - 재시도 필요")
+            return "__NOT_READY__"
+        
         try:
             with zipfile.ZipFile(io.BytesIO(blob)) as zf:
                 names = sorted(zf.namelist(), key=lambda n: zf.getinfo(n).file_size, reverse=True)
@@ -81,8 +90,8 @@ def fetch_document_xml(dart_key, rcept_no):
                 content = zf.read(names[0])
                 print(f"[document.xml] ZIP 내 가장 큰 파일: {names[0]} ({len(content)} bytes)")
         except zipfile.BadZipFile:
-            print(f"[document.xml] ZIP 아님 - 본문 그대로 사용 (응답 본문 일부: {blob[:200]})")
-            content = blob
+            print(f"[document.xml] ZIP 아님 - 재시도 필요")
+            return "__NOT_READY__"
         
         for enc in ("utf-8", "cp949", "euc-kr"):
             try:
@@ -977,9 +986,14 @@ def parse_disclosure_details(dart_key, rcept_no, pymd_str=None, base_price=None)
         "redemption_rate": "-",
         "exchange_target": "-",
         "premium_rate": "-",
+        "_not_ready": False,
     }
     
     xml = fetch_document_xml(dart_key, rcept_no)
+    if xml == "__NOT_READY__":
+        # 공시 원문이 아직 생성되지 않음 → 재시도 필요 신호
+        result["_not_ready"] = True
+        return result
     if not xml:
         return result
     
@@ -1114,8 +1128,17 @@ def parse_disclosure_details(dart_key, rcept_no, pymd_str=None, base_price=None)
 
 if __name__ == "__main__":
     import os
-    dart_key = os.environ.get("DART_API_KEY", "")
-    if not dart_key:
-        print("DART_API_KEY 환경변수를 설정하십시오.")
-        exit(1)
-    # 테스트용 케이스는 필요시 직접 입력
+    dart_key = os.environ.get("DART_API_KEY", "f8a8d38311d5a3914032697a62b2ada1eb228624")
+    
+    test_cases = [
+        ("20260520000262", "20260528", 5424, "엔젯 BW"),
+        ("20260521000803", "20260528", 3875, "이엔플러스 CB"),
+        ("20260521800995", "20260529", 5350, "에이프로젠 CB"),
+        ("20260522000559", "20260610", 13070, "뉴라텍 CB"),
+    ]
+    
+    for rcept_no, pymd_str, base_price, name in test_cases:
+        print(f"\n=== {name} ({rcept_no}) ===")
+        result = parse_disclosure_details(dart_key, rcept_no, pymd_str, base_price)
+        for k, v in result.items():
+            print(f"  {k}: {v}")
