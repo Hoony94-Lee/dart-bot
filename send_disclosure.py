@@ -161,19 +161,31 @@ def get_price_ref_date(rcept_dt, rcept_tm):
     공시 시간 기준으로 종가 기준일 결정
     - 15:30 이후 공시 → 이사회결의일 당일 종가
     - 15:30 이전 공시 → 이사회결의일 전일 종가
+    - rcept_tm이 없으면 → 전일 종가 (보수적)
     """
-    if not rcept_dt or not rcept_tm:
+    if not rcept_dt:
         return "-"
     try:
-        tm_int = int(str(rcept_tm).zfill(4))
         date_obj = datetime.strptime(rcept_dt, "%Y%m%d")
+    except (ValueError, TypeError):
+        return "-"
+    
+    # rcept_tm이 없으면 전일 종가 기준으로 fallback
+    if not rcept_tm or str(rcept_tm).strip() in ("", "-"):
+        prev_date = date_obj - timedelta(days=1)
+        return prev_date.strftime("%Y-%m-%d")
+    
+    try:
+        tm_int = int(str(rcept_tm).zfill(4))
         if tm_int >= 1530:
             return date_obj.strftime("%Y-%m-%d")
         else:
             prev_date = date_obj - timedelta(days=1)
             return prev_date.strftime("%Y-%m-%d")
     except (ValueError, TypeError):
-        return "-"
+        # 시각 파싱 실패 시 전일 종가
+        prev_date = date_obj - timedelta(days=1)
+        return prev_date.strftime("%Y-%m-%d")
 
 
 def fmt_short_date(date_str):
@@ -396,6 +408,11 @@ def format_bond_message(item, detail):
     pymd_str = safe_get(detail, "pymd")
     parsed = parse_disclosure_details(DART_KEY, rcept_no, pymd_str, base_price)
     
+    # 원문 미생성(014) 시 발송하지 않고 다음 사이클에 재시도
+    if parsed.get("_not_ready"):
+        print(f"[format_bond_message] 원문 미생성 - 재시도 대기 ({rcept_no})")
+        return None
+    
     # 금리 조건
     coupon = safe_get(detail, "bd_intr_ex")
     ytm = safe_get(detail, "bd_intr_sf")
@@ -486,10 +503,12 @@ def _format_ri_preferred(item, detail, corp, url, stock_type, method):
     pymd_str = safe_get(detail, "pymd")
     parsed = parse_disclosure_details(DART_KEY, rcept_no, pymd_str, base_price)
     
+    if parsed.get("_not_ready"):
+        print(f"[_format_ri_preferred] 원문 미생성 - 재시도 대기 ({rcept_no})")
+        return "__RETRY__"
+    
     board_date = fmt_date(safe_get(detail, "bddd"))
     pay_date = fmt_date(safe_get(detail, "pymd"))
-    
-    # 상환권 있는 우선주 판정 (RCPS, RPS, 상환전환우선주, 상환우선주 등)
     has_redemption = any(kw in stock_type for kw in [
         "상환전환우선주",
         "전환상환우선주",
@@ -556,6 +575,10 @@ def _format_ri_public(item, detail, corp, url, stock_type, method):
     
     pymd_str = safe_get(detail, "pymd")
     parsed = parse_disclosure_details(DART_KEY, rcept_no, pymd_str, base_price)
+    
+    if parsed.get("_not_ready"):
+        print(f"[_format_ri_public] 원문 미생성 - 재시도 대기 ({rcept_no})")
+        return "__RETRY__"
     
     new_shares = fmt_num(safe_get(detail, "nstk_ostk_cnt"))
     
@@ -638,9 +661,14 @@ def main():
     for item in new_items:
         try:
             msg = format_message(item)
+            
+            # 원문 미생성(014) → sent 기록 안 함, 다음 사이클 재시도
+            if msg == "__RETRY__":
+                print(f"재시도 대기 (원문 미생성): {item['corp_name']} - {item['rcept_no']}")
+                continue
+            
             if msg is None:
                 # 상세 조회 실패 또는 처리 대상 아닌 공시 (예: 제3자배정 보통주)
-                # 처리 대상 아닌 케이스만 sent에 기록하고, 일시 실패는 재시도되도록 sent에 추가하지 않음
                 type_code = item.get("_type_code", "")
                 if type_code == "RI":
                     # 유상증자 중 처리 대상 아닌 케이스는 sent 기록 (재발송 방지)
