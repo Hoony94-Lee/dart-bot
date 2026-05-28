@@ -34,7 +34,7 @@ def get_stock_code(corp_code, dart_key):
 # ============== 1차: NaverFinance ==============
 def naver_fetch_close_price(stock_code, target_date):
     """NaverFinance 일별시세 API"""
-    if not stock_code or not target_date:
+    if not stock_code or not target_date or target_date == "-":
         return None
     try:
         target_dt = datetime.strptime(target_date, "%Y-%m-%d")
@@ -116,7 +116,7 @@ def krx_fetch_close_price(stock_code, target_date):
     
     target_date: "YYYY-MM-DD"
     """
-    if not stock_code or not target_date:
+    if not stock_code or not target_date or target_date == "-":
         return None
     try:
         target_dt = datetime.strptime(target_date, "%Y-%m-%d")
@@ -176,6 +176,8 @@ def krx_fetch_close_price(stock_code, target_date):
 # ============== 3차: pykrx (선택사항) ==============
 def pykrx_fetch_data(stock_code, target_date):
     """pykrx 라이브러리 사용 (설치 필요: pip install pykrx)"""
+    if not target_date or target_date == "-":
+        return None
     try:
         from pykrx import stock
         
