@@ -464,14 +464,24 @@ def format_ri_message(item, detail):
     stock_type = safe_get(detail, "nstk_kndn")
     method = safe_get(detail, "ic_mthn")
     
-    public_keywords = ["주주배정", "일반공모", "실권주"]
-    is_public = any(kw in method for kw in public_keywords)
-    
+    # 우선주(CPS/RCPS 등)는 우선 처리
     if is_preferred_stock(stock_type):
         return _format_ri_preferred(item, detail, corp, url, stock_type, method)
+    
+    # 공모 판정: DART 필드 우선, 애매하면 본문에서 보조 판정
+    public_keywords = ["주주배정", "일반공모", "실권주", "소액공모"]
+    is_public = any(kw in method for kw in public_keywords)
+    
+    # DART 필드가 명확히 제3자배정이면 제외
+    if "제3자배정" in method or "제 3 자" in method:
+        return None
+    
     if is_public:
         return _format_ri_public(item, detail, corp, url, stock_type, method)
-    return None
+    
+    # method가 불명확하면 _format_ri_public에서 본문 기반 재판정
+    # (offering_type이 "공모"면 발송, "제3자배정"이면 None)
+    return _format_ri_public(item, detail, corp, url, stock_type, method, verify_by_body=True)
 
 
 def _format_ri_preferred(item, detail, corp, url, stock_type, method):
@@ -509,6 +519,8 @@ def _format_ri_preferred(item, detail, corp, url, stock_type, method):
     
     board_date = fmt_date(safe_get(detail, "bddd"))
     pay_date = fmt_date(safe_get(detail, "pymd"))
+    
+    # 상환권 판정: 종류명(nstk_kndn) 우선, 본문 상환이율 잡히면 보조 인정
     has_redemption = any(kw in stock_type for kw in [
         "상환전환우선주",
         "전환상환우선주",
@@ -516,6 +528,9 @@ def _format_ri_preferred(item, detail, corp, url, stock_type, method):
         "RCPS",
         "RPS",
     ])
+    # 종류명에 없어도 본문에서 상환이율이 추출되면 상환권 있는 것으로 간주
+    if not has_redemption and parsed.get("redemption_rate", "-") != "-":
+        has_redemption = True
     
     # 상환권 있는 경우에만 Put Option + 상환이율 표시
     if has_redemption:
@@ -553,7 +568,7 @@ def _format_ri_preferred(item, detail, corp, url, stock_type, method):
     )
 
 
-def _format_ri_public(item, detail, corp, url, stock_type, method):
+def _format_ri_public(item, detail, corp, url, stock_type, method, verify_by_body=False):
     """공모 유상증자"""
     rcept_dt = item.get("rcept_dt", "")
     rcept_tm = item.get("rcept_tm", "")
@@ -580,6 +595,20 @@ def _format_ri_public(item, detail, corp, url, stock_type, method):
         print(f"[_format_ri_public] 원문 미생성 - 재시도 대기 ({rcept_no})")
         return "__RETRY__"
     
+    # 본문 기반 재판정: DART 필드가 애매했던 경우
+    offering_type = parsed.get("offering_type", "불명")
+    if verify_by_body:
+        if offering_type == "제3자배정":
+            print(f"[_format_ri_public] 본문 분류 제3자배정 - 제외 ({rcept_no})")
+            return None
+        if offering_type == "불명":
+            # 공모 근거 없음 → 제외 (보통주 제3자배정 가능성)
+            print(f"[_format_ri_public] 본문 분류 불명 - 제외 ({rcept_no})")
+            return None
+    
+    # 증자방식 표기: 본문 정규화 문구 우선, 없으면 DART 필드
+    method_str = parsed.get("offering_method") or method
+    
     new_shares = fmt_num(safe_get(detail, "nstk_ostk_cnt"))
     
     board_date = fmt_date(safe_get(detail, "bddd"))
@@ -599,7 +628,7 @@ def _format_ri_public(item, detail, corp, url, stock_type, method):
     return (
         f"✅주요사항보고서(유상증자결정)\n"
         f"기업명: {corp} (시가총액 {mkt_cap_str}억원)\n"
-        f"증자방식: {method}\n"
+        f"증자방식: {method_str}\n"
         f"발행금액: {amount}\n"
         f"신주의 종류와 수: {new_shares_str}\n"
         f"예정 발행가액: {issue_price}원 ({fmt_short_date(price_ref_date)} 종가 {close_price_str}원)\n"
